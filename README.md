@@ -22,7 +22,7 @@ Garlic LLM is a homebrew app for the PlayStation 4. It runs [Qwen3.5-9B](https:/
 
 Everything runs on the console. Nothing is sent anywhere.
 
-Speeds were measured on a base/Slim PS4. On a PS4 Pro, chat runs at up to 45 tokens/s, and a native PS4 Pro mode reaches up to 60 tokens/s; that mode is not in the download yet. In voice mode the chat model runs at about 22 tokens/s, because the voice model takes the memory that speculative decoding uses.
+Speeds were measured on a base/Slim PS4. On a PS4 Pro, chat runs at up to 45 tokens/s, and a native PS4 Pro mode reaches up to 60 tokens/s; that mode comes with the [experimental version 1.20](https://garlicllm.dev/download/#h-exp). In voice mode the chat model runs at about 22 tokens/s, because the voice model takes the memory that speculative decoding uses.
 
 ## Requirements
 
@@ -178,7 +178,7 @@ The scripts that made them from the original checkpoints are in `pc/`, and each 
 
 **Does it need internet?** No. The model, the voices and the speech recognition run on the console.
 
-**Does it run on a PS4 Pro?** Yes, at up to 45 tokens/s. The Pro runs Garlic as if it were a base PS4. A native PS4 Pro mode, which uses the Pro's full GPU, reaches up to 60 tokens/s; it is not in the download yet.
+**Does it run on a PS4 Pro?** Yes, at up to 45 tokens/s. The Pro runs Garlic as if it were a base PS4. A native PS4 Pro mode, which uses the Pro's full GPU, reaches up to 60 tokens/s; it comes with the [experimental version 1.20](https://garlicllm.dev/download/#h-exp).
 
 **And on a PS5?** No. Garlic LLM is written for the PS4's GPU and system software.
 
