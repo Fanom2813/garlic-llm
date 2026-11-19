@@ -5,8 +5,9 @@
 // it (GARLIC_SPEC), and Circle on the controller stops it. What the screen shows meanwhile is main.c's part
 // (api_chat_begin / _reply / _step / _end).
 
-static uint32_t api_ids[16384];   // the prompt of a job (byte-level tokens: at most one per byte of text)
-#define API_MAX_TEXT 15000        // bytes of message text a request may carry (the prompt must fit api_ids)
+#define API_IDS 16384             // tokens a job's prompt may have: the longest context of the app
+#define API_TAIL 32               // kept free for the assistant's turn after the messages (at most 17 tokens)
+static uint32_t api_ids[API_IDS];   // the prompt of a job
 
 // How many bytes at the start of p (n) are whole UTF-8 characters (the rest waits for the next token).
 static size_t api_utf8_whole(const uint8_t* p, size_t n) {
@@ -34,37 +35,43 @@ static int api_send_event(int fd, const char* json) {
 }
 
 // Builds the prompt: each message as <|im_start|>role\ncontent<|im_end|>\n, then the assistant's turn with the empty
-// thought block (as the chat does, enable_thinking=false). Returns the number of ids, or -1 if it does not fit.
+// thought block (as the chat does, enable_thinking=false). Returns the number of ids, -1 if a message is malformed,
+// or -2 if the messages do not fit API_IDS. The limit counts tokens, not bytes: a long conversation may use the
+// whole context. (Every token stands for one byte or more, so the tail after the messages always fits API_TAIL.)
 static int api_prompt(const JNode* pool, const ChatRequest* cr) {
+    const int cap = API_IDS - API_TAIL;   // where the messages must end
     int n = 0;
-    size_t total = 0;
     for (int m = pool[cr->messages].first; m >= 0; m = pool[m].next) {
         Sb content;
         sb_init(&content);
         char role[16] = "user";
         int ok = api_message(pool, m, role, sizeof(role), &content) == 0;
-        if (ok) total += content.n;
-        if (!ok || total > API_MAX_TEXT) {
+        if (!ok || content.oom) {
             sb_free(&content);
             return -1;
         }
         if (strcmp(role, "system") && strcmp(role, "assistant") && strcmp(role, "user") && strcmp(role, "tool"))
             strcpy(role, "user");
+        if (n >= cap) {
+            sb_free(&content);
+            return -2;
+        }
         api_ids[n++] = IM_START;
-        n = encode_into(api_ids, n, 16384, role);
-        n = encode_into(api_ids, n, 16384, "\n");
-        if (content.p) n = encode_into(api_ids, n, 16384, content.p);
-        api_ids[n++] = IM_END;
-        n = encode_into(api_ids, n, 16384, "\n");
+        n = encode_into(api_ids, n, cap, role);
+        n = encode_into(api_ids, n, cap, "\n");
+        if (content.p) n = encode_into(api_ids, n, cap, content.p);
         sb_free(&content);
+        if (n + 2 > cap) return -2;   // the text filled what was left (it may have been cut): too long
+        api_ids[n++] = IM_END;
+        n = encode_into(api_ids, n, cap, "\n");
     }
     api_ids[n++] = IM_START;
-    n = encode_into(api_ids, n, 16384, "assistant\n");
+    n = encode_into(api_ids, n, API_IDS, "assistant\n");
     if (eng.qwen35) {
         api_ids[n++] = THINK;
-        n = encode_into(api_ids, n, 16384, "\n\n");
+        n = encode_into(api_ids, n, API_IDS, "\n\n");
         api_ids[n++] = THINK_END;
-        n = encode_into(api_ids, n, 16384, "\n\n");
+        n = encode_into(api_ids, n, API_IDS, "\n\n");
     }
     return n;
 }
@@ -96,9 +103,15 @@ static void api_job(ApiJob* job) {
         return;
     }
     int n = api_prompt(pool, &cr);
+    if (n == -1) {
+        free(pool);
+        api_error(job->fd, "HTTP/1.1 400 Bad Request", "A message is malformed: it needs a 'role', and 'content' must "
+                  "be a string or an array of parts.", "invalid_request_error", "invalid_body");
+        return;
+    }
     if (n < 0) {
         free(pool);
-        api_error(job->fd, "HTTP/1.1 400 Bad Request", "The messages are malformed or too long.",
+        api_error(job->fd, "HTTP/1.1 400 Bad Request", "The messages do not fit the context window.",
                   "invalid_request_error", "context_length_exceeded");
         return;
     }
@@ -234,7 +247,10 @@ static void api_job(ApiJob* job) {
         Sb body, head;
         sb_init(&body);
         sb_init(&head);
-        api_json_completion(&body, id, model, created, text.p ? text.p : "", text.n, finish, n, produced);
+        // a reply cut short (max_tokens, Circle) may end inside a character: those bytes are left out, as in a stream,
+        // so the JSON stays valid UTF-8
+        size_t tn = text.p ? api_utf8_whole((const uint8_t*)text.p, text.n) : 0;
+        api_json_completion(&body, id, model, created, text.p ? text.p : "", tn, finish, n, produced);
         sb_str(&head, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: ");
         sb_int(&head, (long long)body.n);
         sb_str(&head, "\r\nAccess-Control-Allow-Origin: *\r\nConnection: close\r\n\r\n");

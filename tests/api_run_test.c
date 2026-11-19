@@ -323,6 +323,61 @@ static void test_stop(void) {
     CHECK(pos == 0);
 }
 
+// The prompt's limit is counted in tokens, and nothing is ever written past api_ids.
+static char big[40000];
+static const char* long_body(int text_bytes, int empty_messages, int max_tokens) {
+    size_t n = (size_t)sprintf(big, "{\"messages\":[{\"role\":\"user\",\"content\":\"");
+    memset(big + n, 'x', (size_t)text_bytes);
+    n += (size_t)text_bytes;
+    n += (size_t)sprintf(big + n, "\"}");
+    for (int i = 0; i < empty_messages; i++) n += (size_t)sprintf(big + n, ",{\"role\":\"user\"}");
+    sprintf(big + n, "],\"max_tokens\":%d}", max_tokens);
+    return big;
+}
+
+static void test_long_prompt(void) {
+    int cleared = msgs_cleared, begun = chat_begun;
+    // many messages without text after a long one: once more ids than api_ids holds (it used to write past it)
+    run_job(long_body(15000, 509, 1), NULL, 0);
+    CHECK(strncmp(wire, "HTTP/1.1 400 Bad Request", 23) == 0);
+    CHECK(strstr(wire, "context_length_exceeded") != NULL);
+    CHECK(engine_calls == 0);
+    CHECK(msgs_cleared == cleared && chat_begun == begun);
+
+    // more than the old 15000 bytes of text is fine while the tokens fit the context
+    static const uint32_t sc[] = {'O' + 1, 'K' + 1};
+    eng.ctx_limit = API_IDS;
+    run_job(long_body(15500, 0, 2), sc, 2);
+    CHECK(strncmp(wire, "HTTP/1.1 200 OK", 15) == 0);
+    // <im_start> "user" "\n" 15500 bytes <im_end> "\n" = 15508, and the assistant's turn 17 (see test_completion)
+    CHECK(prompt_len_seen == 15525);
+    CHECK(strstr(wire, "\"content\":\"OK\"") != NULL);
+
+    // text that does not fit the ids at all (the encoder stops at the limit: never a cut prompt)
+    run_job(long_body(16400, 0, 1), NULL, 0);
+    CHECK(strstr(wire, "context_length_exceeded") != NULL);
+    eng.ctx_limit = 4096;
+
+    // a malformed message is not called too long
+    run_job("{\"messages\":[{\"role\":\"user\",\"content\":5}]}", NULL, 0);
+    CHECK(strncmp(wire, "HTTP/1.1 400 Bad Request", 23) == 0);
+    CHECK(strstr(wire, "invalid_body") != NULL);
+    CHECK(strstr(wire, "context_length_exceeded") == NULL);
+}
+
+// A whole reply cut by max_tokens between the two halves of "é" ends before it: the JSON stays valid UTF-8.
+static void test_cut_char(void) {
+    static const uint32_t sc[] = {'a' + 1, 500, 501};
+    run_job("{\"messages\":[{\"role\":\"user\",\"content\":\"x\"}],\"max_tokens\":2}", sc, 3);
+    CHECK(strstr(wire, "\"content\":\"a\"") != NULL);
+    CHECK(strchr(body_of(wire), '\xc3') == NULL);
+    CHECK(strstr(wire, "\"completion_tokens\":2") != NULL);
+    CHECK(strstr(wire, "\"finish_reason\":\"length\"") != NULL);
+
+    run_job("{\"messages\":[{\"role\":\"user\",\"content\":\"x\"}],\"max_tokens\":3}", sc, 3);   // whole: kept
+    CHECK(strstr(wire, "\"content\":\"a\xc3\xa9\"") != NULL);
+}
+
 static void test_utf8(void) {
     CHECK(api_utf8_whole((const uint8_t*)"\xc3", 1) == 0);
     CHECK(api_utf8_whole((const uint8_t*)"a\xc3", 2) == 1);
@@ -342,7 +397,9 @@ int main(void) {
         test_client_gone();
         test_spec();
         test_stop();
-        CHECK(pos_errors == 0);            // every token went in at the position after the one before
+        test_long_prompt();
+        test_cut_char();
+        CHECK(pos_errors == 0);           // every token went in at the position after the one before
         CHECK(chat_begun == chat_ended);   // every request that took the screen gave it back
         CHECK(chat_replies <= chat_begun);
     }
