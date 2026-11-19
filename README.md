@@ -96,7 +96,7 @@ The app is built with the open-source [OpenOrbis](https://github.com/OpenOrbis/O
 
 Garlic LLM can serve an OpenAI-compatible API on your network, so that your own programs and apps use the model on the console. It is off until you turn it on.
 
-> The API is new. It is in the source code and comes with the next package; version 1.19 does not have it yet.
+> The API is new in version 1.20.
 
 **Turn it on.** On the chat screen, press **L3** (click the left stick). The top of the screen then shows where the API listens, for example `API · 192.168.1.5:8080`. L3 again turns it off, and the app remembers the choice for the next time.
 
