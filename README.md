@@ -4,6 +4,8 @@
 
 **A 9-billion-parameter language model running on a PS4. Offline.**
 
+> **About this fork.** This fork of [Garlic LLM](https://github.com/leonardo-alegria/garlic-llm) by Leonardo Alegria adds **Garlic Server**: the PS4 as a headless inference box for coding agents on your network. It includes a new engine for [Maple Preview](https://huggingface.co/deepgrove/maple-preview) (20B mixture of experts, ternary, ~104 tokens/s on a base PS4), a prompt cache, discovery over UDP, and an OpenAI/Anthropic-compatible API on your computer through a native Mac menu bar app (`mac/`) or a Python proxy (`proxy/`). See **[docs/SERVER.md](docs/SERVER.md)**. Everything below is the original project's README. Please report problems with the fork's additions here, not to the original author.
+
 Garlic LLM is a homebrew app for the PlayStation 4. It runs [Qwen3.5-9B](https://huggingface.co/Qwen) on the console's own GPU, with no PC and no internet while it runs. It also listens, talks, and runs the Python it writes.
 
 [Website](https://garlicllm.dev) · [Download](#install) · [Demo video](https://garlicllm.dev/#demo) · [Support the project](#support)
