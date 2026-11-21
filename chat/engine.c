@@ -63,6 +63,12 @@ static void spec_prefill(Engine* e, uint64_t stage, uint32_t n, uint32_t pos0);
 uint64_t spec_carry(void);
 #endif
 static int gpu_selftest(Engine* e);   // (after begin)
+// Maple-Preview (engine_maple.inc, at the end)
+static int maple_init(Engine* e, const char* dir, ProgressFn progress, void* user);
+static int maple_run(Engine* e, const uint32_t* tokens, int n, int pos0, float temperature, uint32_t seed, uint32_t* next);
+static uint64_t maple_state_size(const Engine* e);
+static int maple_state_copy(Engine* e, uint64_t buf, int save);
+static void asset_path(char* out, size_t n, const char* dir, const char* name);
 
 static void fail(Engine* e, const char* fmt, ...) {
     va_list ap;
@@ -76,8 +82,37 @@ static void fail(Engine* e, const char* fmt, ...) {
 
 // Where a weights file is: inside the package (/app0/models, the all-in-one PKG) or, with an app-only package, at the
 // path its index names (in /data). The first one that exists; path (129 bytes or more) is rewritten in place.
+// The selected model's folder on the console (server mode: /data/garlic/models/<name>), or NULL. Its files take the
+// place of the package's (model.idx, mtp.idx, kernels.bin) and its weights come first.
+const char* engine_model_dir;
+
+static int file_exists(const char* p) {
+    int f = open(p, O_RDONLY);
+    if (f < 0) return 0;
+    close(f);
+    return 1;
+}
+
+// dir/name, unless the model folder has that file: then model_dir/name.
+static void asset_path(char* out, size_t n, const char* dir, const char* name) {
+    if (engine_model_dir) {
+        snprintf(out, n, "%s/%s", engine_model_dir, name);
+        if (file_exists(out)) return;
+    }
+    snprintf(out, n, "%s/%s", dir, name);
+}
+
 static void weights_locate(char* path) {
     const char* base = strrchr(path, '/');
+    if (engine_model_dir) {   // the model folder first
+        char p[129];
+        snprintf(p, sizeof(p), "%s/%s", engine_model_dir, base ? base + 1 : path);
+        if (file_exists(p)) {
+            strcpy(path, p);
+            say("weights: %s", path);
+            return;
+        }
+    }
     char in_pkg[129];
     snprintf(in_pkg, sizeof(in_pkg), "/app0/models/%s", base ? base + 1 : path);
     int f = open(in_pkg, O_RDONLY);
@@ -158,7 +193,7 @@ static const GpuKernel* kernel(Engine* e, const char* name) {
 static int load_kernels(Engine* e, const char* dir) {
     char path[256];
     size_t size;
-    snprintf(path, sizeof(path), "%s/kernels.bin", dir);
+    asset_path(path, sizeof(path), dir, "kernels.bin");
     uint8_t* d = read_file(path, &size);
     if (!d || memcmp(d, "PKRN", 4)) {
         fail(e, "cannot read %s", path);
@@ -266,7 +301,7 @@ static int load_kernels(Engine* e, const char* dir) {
 static int load_index(Engine* e, const char* dir) {
     char path[256];
     size_t size;
-    snprintf(path, sizeof(path), "%s/model.idx", dir);
+    asset_path(path, sizeof(path), dir, "model.idx");
     uint8_t* d = read_file(path, &size);
     if (!d || (memcmp(d, "PMDL", 4) && memcmp(d, "PMQ5", 4))) {
         fail(e, "cannot read %s", path);
@@ -340,6 +375,16 @@ int engine_init(Engine* e, const char* dir, ProgressFn progress, void* user) {
     e->tsc_freq = sceKernelGetTscFrequency();
     e->neo = sceKernelIsNeoMode() == 1;
     e->pf_rows = e->neo ? 64 : PF_ROWS;
+    {   // a Maple model folder (model.idx "PMAP") has its own path
+        char path[256], magic[4] = {0};
+        asset_path(path, sizeof(path), dir, "model.idx");
+        int f = open(path, O_RDONLY);
+        if (f >= 0) {
+            if (read(f, magic, 4) != 4) magic[0] = 0;
+            close(f);
+        }
+        if (!memcmp(magic, "PMAP", 4)) return maple_init(e, dir, progress, user);
+    }
     if (load_index(e, dir)) return -1;
     if (reserve_garlic(e)) {
         fail(e, "could not reserve GPU memory");
@@ -612,6 +657,7 @@ uint64_t engine_kv_lend(Engine* e, uint64_t* size) {
 void engine_kv_return(Engine* e) { e->ctx_limit = e->max_seq; }
 
 void engine_reset(Engine* e) {
+    if (e->maple) return;   // (its caches are written by position)
     for (uint32_t i = 0; i < e->n_layers; i++)
         if (!(e->full_mask >> i & 1)) {
             memset((void*)(uintptr_t)e->kc[i], 0, e->conv_n * 12);
@@ -1142,7 +1188,12 @@ static int gpu_selftest(Engine* e) {
 // The Gated DeltaNet layers' state (conv and delta rule), copied on the GPU to buf (save 1) or back from it (save 0).
 // With the attention cache, which is written by position, that is all a conversation needs to go back to an earlier
 // position: main.c takes a turn's reasoning out of the history this way ("Pensar"). 50.25 MiB for the 9B.
+// A block of the engine's GPU memory for the app (server mode: the prompt cache's state snapshot, the MTP head).
+// 0 if it does not fit. Never given back.
+uint64_t engine_alloc(Engine* e, uint64_t size) { return gpu_alloc(e, size); }
+
 uint64_t engine_state_size(const Engine* e) {
+    if (e->maple) return maple_state_size(e);
     uint64_t n = 0;
     for (uint32_t i = 0; i < e->n_layers; i++)
         if (!(e->full_mask >> i & 1)) n += ((e->conv_n * 12 + 255) & ~255ull) + ((e->state_bytes + 255) & ~255ull);
@@ -1153,6 +1204,7 @@ uint64_t engine_state_size(const Engine* e) {
 }
 
 int engine_state_copy(Engine* e, uint64_t buf, int save) {
+    if (e->maple) return maple_state_copy(e, buf, save);
     if (!e->qwen35 || !e->k_copy) return -1;
     begin(e);
     uint64_t p = buf;
@@ -1174,6 +1226,7 @@ int engine_state_copy(Engine* e, uint64_t buf, int save) {
 }
 
 int engine_run(Engine* e, const uint32_t* tokens, int n, int pos0, float temperature, uint32_t seed, uint32_t* next) {
+    if (e->maple) return maple_run(e, tokens, n, pos0, temperature, seed, next);
     if (pos0 + n > (int)e->max_seq || pos0 + n > (int)e->ctx_limit) {
         fail(e, "context full (%d tokens)", pos0 + n);
         return -1;
@@ -1809,3 +1862,5 @@ int asr_reload(Engine* e) {
 #ifdef GARLIC_SPEC
 #include "engine_spec.inc"
 #endif
+
+#include "engine_maple.inc"   // Maple-Preview (model.idx "PMAP")

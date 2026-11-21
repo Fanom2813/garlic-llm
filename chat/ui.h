@@ -147,3 +147,26 @@ void draw_run_intro(const char* title, float t);                 // transition f
 // ---- voice mode: talk to Garlic without the chat; only its words are shown ----
 enum { VM_IDLE, VM_LISTEN, VM_THINK, VM_SPEAK };
 void draw_voice_mode(int state, const char* reply, float level, double time);
+
+// ---- server mode (main.c GARLIC_SERVER): the dashboard instead of the chat ----
+#define SRV_SPARK 90
+typedef struct {
+    const char* model;          // the loaded model
+    const char* address;        // where the API listens ("192.168.1.17:8080")
+    int state;                  // 0 idle, 1 reading the prompt, 2 generating
+    float tok_s;                // generation speed now (tokens/s)
+    float prompt_tok_s;         // prompt reading speed of the current / last request
+    int prompt_n, prompt_done, cached_n, generated_n;   // current (or last) request
+    float last_tok_s;           // the last request's average generation speed
+    unsigned requests;
+    unsigned long long tokens_in, tokens_out, tokens_cached;
+    unsigned gpu_used_mb, gpu_total_mb, ctx;
+    float spark[SRV_SPARK];     // generation speed history, oldest first
+    int n_spark;
+    // the model picker (Triangle)
+    int picker;                 // 1: open
+    const char* const* models;
+    int n_models, sel, current;
+    const char* note;           // a line under the header ("Loading Maple…", an error)
+} ServerView;
+void draw_server(const ServerView* v);

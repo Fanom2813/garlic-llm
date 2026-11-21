@@ -14,6 +14,7 @@ typedef struct ApiJob {
     char* body;                 // the request's JSON (validated by the server thread)
     size_t body_len;
     volatile int done;          // 1 once the main thread has written the reply
+    int raw;                    // 1: a /v1/raw job (token ids in, token ids out; body is binary, see api_run.inc)
     struct ApiJob* next;
 } ApiJob;
 
@@ -23,6 +24,7 @@ int api_enable(int on);
 int api_enabled(void);
 // Where the API listens while it is on: "192.168.1.5:8080", or ":8080" if the console's address is not known.
 const char* api_address(void);
+void api_set_name(const char* name);   // the model name in the UDP announcement (port 8099)
 // Main thread: the job waiting for the model, or NULL. Its reply must be written to job->fd, then api_done(job).
 ApiJob* api_take(void);
 void api_done(ApiJob* job);

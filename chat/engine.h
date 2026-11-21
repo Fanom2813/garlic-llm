@@ -142,6 +142,7 @@ typedef struct {
     float eps, rope_theta;
     // Qwen3.5 (model.idx "PMQ5"): Gated DeltaNet shape, partial RoPE, which layers are full attention
     int qwen35, neo;
+    int maple;              // model.idx "PMAP": Maple-Preview (chat/engine_maple.inc)
     uint32_t pf_rows;
     uint32_t n_kh, n_vh, dk, dv, rope_dim, full_mask, im_start, im_end;
     uint32_t* layer_base;   // index in t[] of each layer's first tensor (attn_norm)
@@ -241,6 +242,8 @@ int32_t engine_row_of(const Engine* e, uint32_t token);
 void engine_reset(Engine* e);
 // The Gated DeltaNet states saved to GPU memory at buf (engine_state_size bytes; save 1) or put back from it
 // (save 0), so that the conversation can go back to the position where they were saved. 0 = done.
+uint64_t engine_alloc(Engine* e, uint64_t size);
+extern const char* engine_model_dir;   // a model folder that overrides the package's assets (engine.c)
 uint64_t engine_state_size(const Engine* e);
 int engine_state_copy(Engine* e, uint64_t buf, int save);
 // Load Parakeet into the GPU memory still free (after engine_init). 0 if ready, -1 if missing or too big.

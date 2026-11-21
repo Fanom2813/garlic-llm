@@ -81,7 +81,7 @@ int spec_init(Engine* e, const char* dir) {
     memset(s, 0, sizeof(*s));
     char p[256];
     size_t sz;
-    snprintf(p, sizeof(p), "%s/mtp.idx", dir);
+    asset_path(p, sizeof(p), dir, "mtp.idx");
     uint8_t* d = read_file(p, &sz);
     if (!d || sz < 156 + MT_N * 36 || memcmp(d, "PMTP", 4) || !e->swar || !e->ids) {
         free(d);

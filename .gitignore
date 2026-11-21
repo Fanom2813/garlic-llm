@@ -9,3 +9,8 @@ toolchain/
 models/
 third_party/
 pc/fonts_libres/
+
+# Mac app build output (mac/make_app.sh)
+mac/.build/
+mac/build/
+mac/.swiftpm/

@@ -20,7 +20,9 @@ WIN = os.name == "nt"
 EXE = ".exe" if WIN else ""                       # the tools' names on Windows and on Linux
 ZIG = TOOLCHAIN / "zig" / f"zig{EXE}"
 DOTNET = TOOLCHAIN / "dotnet" / "dotnet.exe"      # Windows only: PkgTool.Core.dll runs on it there
-BIN = OO / ("bin/windows" if WIN else "bin/linux")
+MAC = sys.platform == "darwin"
+BIN = OO / ("bin/windows" if WIN else "bin/macos" if MAC else "bin/linux")
+FSELF = BIN / ("create-fself.exe" if WIN else "create-fself-macos" if MAC else "create-fself")
 BUILD = ROOT / "build"
 PKGDIR = BUILD / "pkg"
 
@@ -28,7 +30,7 @@ PKGDIR = BUILD / "pkg"
 PS4_IP = os.environ.get("PS4_IP", "")
 FTP_PORT = int(os.environ.get("PS4_FTP_PORT") or 2121)
 
-CFLAGS = ["-target", "x86_64-freebsd-none", "-march=btver2", "-O2", "-fPIC", "-funwind-tables",
+CFLAGS = ["-target", "x86_64-pc-freebsd12-elf", "-march=btver2", "-O2", "-fPIC", "-funwind-tables",
           "-fno-stack-protector", "-fshort-wchar", "-nostdinc", "-isystem", str(OO / "include"), "-Wall", "-c"]
 
 

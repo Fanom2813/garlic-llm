@@ -265,3 +265,226 @@ static void api_job(ApiJob* job) {
     need_close = 0;
     api_chat_end();
 }
+
+// ---- /v1/raw: token ids in, token ids out, with a prompt cache (server mode) -------------------------------------
+// For a client that does its own chat template and tokenizing (the PS4 is only the inference engine).
+// Body (little endian): "GRW1", uint32 n_tokens, max_new, float temperature, uint32 seed, n_stop, flags (bit 0: do
+// not use the cache), then n_stop stop ids and n_tokens prompt ids. Generation also stops at <|im_end|> and the eos.
+// Reply: text/plain, one line per event, flushed as it happens:
+//   "c <reused> <prompt>"            how many prompt tokens came from the cache
+//   "p <read> <seconds>"             the rest of the prompt was read in this time
+//   "t <id> [<id> ...]"              generated tokens (several when the MTP head's drafts were kept)
+//   "d <stop|length|cancel> <n> <seconds>"   the end: tokens generated and decode time
+//   "e <message>"                    an error (then the reply ends)
+// Prompt cache: raw_ids holds every token the engine has read (prompt and generated, in order); a new prompt that
+// starts with all of them only reads its new tokens. Otherwise, if it starts with the previous prompt, the DeltaNet
+// state saved at the end of that prompt is put back (Qwen3.5's recurrent layers cannot simply be cut back). Else the
+// prompt is read from the start. Anything else that moves the engine (a chat turn, a /v1/chat job) clears the cache.
+
+static uint32_t raw_ids[API_IDS];
+static int raw_n = -1;            // tokens the engine has read for the cache; -1: the cache is not valid
+static int raw_snap_n = -1;       // the DeltaNet state at this position is saved in raw_snap
+static uint64_t raw_snap;         // GPU block for that copy (main.c allocates it in server mode); 0: none
+// A second copy at the end of the system prompt (its first <|im_start|> after the start): a new conversation of the
+// same agent repeats the system prompt but not the turns after it. Valid while no request reads positions before it.
+static int raw_sys_n = -1;
+static uint64_t raw_sys;
+#define RAW_SYS_MIN 512           // (shorter system prompts are quick to read again)
+
+static void raw_invalidate(void) { raw_n = raw_snap_n = raw_sys_n = -1; }
+
+static int raw_line(int fd, const char* s) { return api_send(fd, s, strlen(s)); }
+
+static void api_raw_job(ApiJob* job) {
+    const uint8_t* b = (const uint8_t*)job->body;
+    uint32_t h[6];
+    memcpy(h, b + 4, sizeof(h));
+    int n = (int)h[0], max_new = (int)h[1], n_stop = (int)h[4], no_cache = h[5] & 1;
+    float temperature;
+    memcpy(&temperature, &h[2], 4);
+    uint32_t rseed = h[3];
+    uint32_t stops[64];
+    memcpy(stops, b + 28, 4ull * n_stop);
+    const uint32_t* toks = (const uint32_t*)(b + 28 + 4 * n_stop);   // (body is malloc'd: aligned)
+    int fd = job->fd;
+    const char* hdr = "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nCache-Control: no-cache\r\n"
+                      "Access-Control-Allow-Origin: *\r\nConnection: close\r\n\r\n";
+    if (api_send(fd, hdr, strlen(hdr))) return;
+    char line[256];
+    if (n > API_IDS - 2 || n + max_new + 2 > (int)eng.ctx_limit) {
+        snprintf(line, sizeof(line), "e prompt (%d) + max_new (%d) does not fit the context (%u)\n", n, max_new,
+                 eng.ctx_limit);
+        raw_line(fd, line);
+        return;
+    }
+    for (int i = 0; i < n; i++)
+        if (toks[i] >= tok.n_vocab) {
+            snprintf(line, sizeof(line), "e token %u at %d is not in the vocabulary (%u)\n", toks[i], i, tok.n_vocab);
+            raw_line(fd, line);
+            return;
+        }
+    // how much of the prompt the engine has read already
+    int start = 0;
+    if (!no_cache && raw_n >= 0) {
+        int c = 0;
+        while (c < raw_n && c < n && raw_ids[c] == toks[c]) c++;
+        if (c == raw_n && c < n) {
+            start = c;   // the prompt goes on from everything read so far
+        } else {         // back to the end of the last prompt, or else to the end of the system prompt
+            int at = -1;
+            uint64_t from = 0;
+            if (raw_snap && raw_snap_n > 0 && raw_snap_n <= c && raw_snap_n < n) at = raw_snap_n, from = raw_snap;
+            if (raw_sys && raw_sys_n > at && raw_sys_n <= c && raw_sys_n < n) at = raw_sys_n, from = raw_sys;
+            if (at > 0 && engine_state_copy(&eng, from, 0) == 0) start = at;
+        }
+    }
+    if (start < raw_sys_n) raw_sys_n = -1;   // (this request writes over positions before it)
+    if (start == 0) engine_reset(&eng);
+    hist_n = hist_done = 0;   // (nothing of the chat is read in the background after this)
+    thinking = think_turn = 0;
+    need_close = 0;
+    sys_pre = 0;
+    api_chat_begin();
+    snprintf(line, sizeof(line), "c %d %d\n", start, n);
+    int client_gone = raw_line(fd, line) != 0;
+    say("raw: prompt %d tokens, %d from the cache, up to %d new, T %.2f", n, start, max_new, temperature);
+    double t0 = now();
+    raw_n = -1;   // (not valid while the engine moves)
+#ifdef GARLIC_SERVER
+    sv.prompt_n = n, sv.cached_n = start, sv.prompt_done = 0;
+    sv.requests++;
+    sv.tokens_in += (unsigned long long)n, sv.tokens_cached += (unsigned long long)start;
+    srv_draw(1);
+    // the prompt in pieces, so the dashboard shows how far it has got (the engine reads it the same way)
+    int pf_err = 0;
+    // The state is also saved just before the prompt's last <|im_start|> (the reply's header): the next request
+    // repeats the conversation up to there, but renders this turn's ending (<think> and so on) differently, so the
+    // saved state at the very end would not match it.
+    int snap_at = -1, snapped = -1;
+    raw_snap_n = -1;
+    if (raw_snap)
+        for (int i = n - 1; i > start; i--)
+            if (toks[i] == eng.im_start) {
+                snap_at = i;
+                break;
+            }
+    int sys_at = -1, sys_snapped = -1;
+    if (raw_sys && raw_sys_n < 0)
+        for (int i = 1; i < n; i++)
+            if (toks[i] == eng.im_start) {
+                if (i > start && i >= RAW_SYS_MIN) sys_at = i;
+                break;
+            }
+    for (int i = start; i < n && !pf_err;) {
+        int lim = n;
+        if (sys_at > i && sys_at < lim) lim = sys_at;
+        if (snap_at > i && snap_at < lim) lim = snap_at;
+        int k = lim - i > 256 ? 256 : lim - i;
+        pf_err = engine_run(&eng, toks + i, k, i, temperature, rseed, &next_token);
+        i += k;
+        if (!pf_err && i == sys_at && engine_state_copy(&eng, raw_sys, 1) == 0) sys_snapped = i;
+        if (!pf_err && i == snap_at && engine_state_copy(&eng, raw_snap, 1) == 0) snapped = i;
+        sv.prompt_done = i - start;
+        double el = now() - t0;
+        if (el > 0) sv.prompt_tok_s = (float)(sv.prompt_done / el);
+        srv_draw(0);
+    }
+    if (pf_err) {
+#else
+    if (engine_run(&eng, toks + start, n - start, start, temperature, rseed, &next_token)) {
+#endif
+        snprintf(line, sizeof(line), "e %s\n", eng.error);
+        raw_line(fd, line);
+        raw_invalidate();
+        api_chat_end();
+        return;
+    }
+    pos = n;
+    memcpy(raw_ids, toks, 4ull * n);
+    raw_n = n;
+#ifdef GARLIC_SERVER
+    if (sys_snapped > 0) raw_sys_n = sys_snapped;
+    if (snapped > 0) raw_snap_n = snapped;
+    else
+#endif
+    if (raw_snap && engine_state_copy(&eng, raw_snap, 1) == 0) raw_snap_n = n;
+    else raw_snap_n = -1;
+    double t_pf = now() - t0;
+    snprintf(line, sizeof(line), "p %d %.3f\n", n - start, t_pf);
+    if (!client_gone && raw_line(fd, line)) client_gone = 1;
+
+    uint32_t q[9];
+    int nq = 1, iq = 0, produced = 0, error = 0;
+    const char* finish = "length";
+    q[0] = next_token;
+    double t1 = now();
+    api_chat_reply();
+    Sb out;
+    sb_init(&out);
+    while (produced < max_new && !client_gone) {
+        uint32_t t = q[iq++];
+        int is_stop = t == IM_END || t == eng.eos || t == eng.eos2;
+        for (int i = 0; i < n_stop && !is_stop; i++) is_stop = t == stops[i];
+        if (is_stop) {   // (the stop token is sent, not read: the next prompt may go on with it)
+            snprintf(line, sizeof(line), "t %u\n", t);
+            if (raw_line(fd, line)) client_gone = 1;
+            finish = "stop";
+            break;
+        }
+        produced++;
+        // tokens of this step go out together
+        if (!out.n) sb_str(&out, "t");
+        snprintf(line, sizeof(line), " %u", t);
+        sb_str(&out, line);
+        if (iq < nq) continue;   // (the next token is a kept draft: already read)
+        sb_str(&out, "\n");
+        if (out.p && api_send(fd, out.p, out.n)) client_gone = 1;
+        out.n = 0;
+        if (client_gone || produced >= max_new) break;
+        if (api_chat_step(produced)) {
+            finish = "cancel";
+            break;
+        }
+        int ne = 0;
+#ifdef GARLIC_SPEC
+        if (spec_active(&eng)) {
+            if (engine_spec_step(&eng, t, pos, temperature, rseed++, max_new - produced + 1, q, &ne, &next_token)) {
+                error = 1;
+                break;
+            }
+        } else
+#endif
+        if (engine_run(&eng, &t, 1, pos, temperature, rseed++, &next_token)) {
+            error = 1;
+            break;
+        }
+        raw_ids[pos] = t;   // what the engine read: t, then the drafts it kept
+        for (int i = 0; i < ne; i++) raw_ids[pos + 1 + i] = q[i];
+        pos += 1 + ne;
+        raw_n = pos;
+        q[ne] = next_token;
+        nq = ne + 1, iq = 0;
+    }
+    if (out.n && !client_gone) {   // tokens still waiting (stopped by max_new between drafts)
+        sb_str(&out, "\n");
+        if (out.p) api_send(fd, out.p, out.n);
+    }
+    sb_free(&out);
+    double dt = now() - t1;
+#ifdef GARLIC_SERVER
+    sv.generated_n = produced;
+    sv.last_tok_s = dt > 0 ? (float)(produced / dt) : 0.0f;
+    sv.tokens_out += (unsigned long long)produced;
+    if (t_pf > 0) sv.prompt_tok_s = (float)((n - start) / t_pf);
+#endif
+    if (error) {
+        snprintf(line, sizeof(line), "e %s\n", eng.error);
+        raw_invalidate();
+    } else {
+        snprintf(line, sizeof(line), "d %s %d %.3f\n", finish, produced, dt);
+    }
+    if (!client_gone) raw_line(fd, line);
+    say("raw: %d tokens in %.1f s (%.1f tokens/s, prompt read %.1f s), %s", produced, dt,
+        dt > 0 ? produced / dt : 0.0, t_pf, error ? "engine error" : finish);
+    api_chat_end();
+}

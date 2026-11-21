@@ -2150,3 +2150,124 @@ void draw_confirm(const char* text) {
 
 #include "ui_run.inc"
 #include "ui_voice.inc"
+
+// ---- server mode dashboard ---------------------------------------------------------------------------------------
+
+static void srv_card(int x, int y, int w, int h, const char* label, const char* value, const char* sub, uint32_t vcol) {
+    rrect(x, y, w, h, 18, C_SURFACE, 235);
+    rrect(x, y, w, 4, 2, C_LINE_HI, 255);
+    draw_str(&font_small, x + 28, y + 24, label, C_TEXT_MUTED);
+    draw_str(&font_big, x + 28, y + 24 + font_small.line + 8, value, vcol);
+    if (sub) draw_str(&font_small, x + 28, y + h - font_small.line - 22, sub, C_TEXT_DIM);
+}
+
+static void srv_fmt_count(char* out, size_t n, unsigned long long v) {
+    if (v < 10000) snprintf(out, n, "%llu", v);
+    else if (v < 10000000) snprintf(out, n, "%.1fk", v / 1000.0);
+    else snprintf(out, n, "%.2fM", v / 1e6);
+}
+
+void draw_server(const ServerView* v) {
+    draw_background();
+    char s[200], sub[200];
+    // header: name and model on the left, API address on the right
+    draw_str(&font_big, 120, 70, "Garlic Server", C_TEXT);
+    snprintf(s, sizeof(s), "Model: %s", v->model ? v->model : "-");
+    draw_str(&font, 120, 70 + font_big.line + 6, s, C_ACCENT_HI);
+    snprintf(s, sizeof(s), "API  %s", v->address ? v->address : "-");
+    draw_str(&font, SCREEN_W - 120 - str_width(&font, s), 78, s, C_TEXT_DIM);
+    // state pill
+    static const char* const names[] = {"Idle - waiting for requests", "Reading the prompt", "Generating"};
+    static const uint32_t cols[] = {C_TEXT_MUTED, C_ACCENT_HI, C_GREEN};
+    int st = v->state < 0 || v->state > 2 ? 0 : v->state;
+    int pw = str_width(&font_small, names[st]) + 64;
+    rrect(SCREEN_W - 120 - pw, 78 + font.line + 14, pw, font_small.line + 18, (font_small.line + 18) / 2, C_SURFACE_HI, 255);
+    rrect(SCREEN_W - 120 - pw + 22, 78 + font.line + 14 + (font_small.line + 18) / 2 - 6, 12, 12, 6, cols[st], 255);
+    draw_str(&font_small, SCREEN_W - 120 - pw + 44, 78 + font.line + 23, names[st], C_TEXT);
+    if (v->note) draw_center(&font_small, SCREEN_W / 2, 250, v->note, C_TEXT_DIM);
+
+    // four cards
+    int cy = 300, ch = 250, gap = 40, cw = (SCREEN_W - 240 - 3 * gap) / 4;
+    snprintf(s, sizeof(s), "%.1f tok/s", st == 2 ? v->tok_s : v->last_tok_s);
+    snprintf(sub, sizeof(sub), st == 2 ? "%d tokens so far" : "last request: %d tokens", v->generated_n);
+    srv_card(120, cy, cw, ch, "GENERATION", s, sub, C_GREEN);
+    if (st == 1 && v->prompt_n > 0) {
+        snprintf(s, sizeof(s), "%d%%", (int)(100.0 * v->prompt_done / (v->prompt_n - v->cached_n > 0 ? v->prompt_n - v->cached_n : 1)));
+        snprintf(sub, sizeof(sub), "%d of %d new tokens", v->prompt_done, v->prompt_n - v->cached_n);
+    } else {
+        snprintf(s, sizeof(s), "%.0f tok/s", v->prompt_tok_s);
+        snprintf(sub, sizeof(sub), "last prompt: %d tokens", v->prompt_n);
+    }
+    srv_card(120 + (cw + gap), cy, cw, ch, "PROMPT READING", s, sub, C_ACCENT_HI);
+    snprintf(s, sizeof(s), "%d%%", v->prompt_n > 0 ? (int)(100.0 * v->cached_n / v->prompt_n) : 0);
+    snprintf(sub, sizeof(sub), "%d of %d tokens reused", v->cached_n, v->prompt_n);
+    srv_card(120 + 2 * (cw + gap), cy, cw, ch, "PROMPT CACHE", s, sub, C_TEXT);
+    snprintf(s, sizeof(s), "%u", v->requests);
+    char a[32], b[32];
+    srv_fmt_count(a, sizeof(a), v->tokens_in);
+    srv_fmt_count(b, sizeof(b), v->tokens_out);
+    snprintf(sub, sizeof(sub), "%s in  /  %s out", a, b);
+    srv_card(120 + 3 * (cw + gap), cy, cw, ch, "REQUESTS", s, sub, C_TEXT);
+
+    // generation speed history
+    int gx = 120, gy = 620, gw = SCREEN_W - 240, gh = 260;
+    rrect(gx, gy, gw, gh, 18, C_SURFACE, 235);
+    draw_str(&font_small, gx + 28, gy + 20, "GENERATION SPEED (tok/s)", C_TEXT_MUTED);
+    float mx = 10.0f;
+    for (int i = 0; i < v->n_spark; i++) if (v->spark[i] > mx) mx = v->spark[i];
+    mx = (float)((int)(mx / 10.0f + 1.0f) * 10);
+    snprintf(s, sizeof(s), "%.0f", mx);
+    draw_str(&font_small, gx + gw - 28 - str_width(&font_small, s), gy + 20, s, C_TEXT_MUTED);
+    int px = gx + 28, pw2 = gw - 56, py = gy + 30 + font_small.line, ph = gh - 60 - font_small.line;
+    rrect(px, py + ph, pw2, 2, 1, C_LINE, 255);
+    float bw = (float)pw2 / SRV_SPARK;
+    for (int i = 0; i < v->n_spark; i++) {
+        int x = px + (int)((SRV_SPARK - v->n_spark + i) * bw);
+        int h = (int)(ph * (v->spark[i] / mx));
+        if (h < 2) h = 2;
+        rrect(x + 1, py + ph - h, (int)bw - 2 > 2 ? (int)bw - 2 : 2, h, 2, i == v->n_spark - 1 ? C_GREEN : C_ACCENT, 230);
+    }
+
+    // footer: memory, context, controls
+    snprintf(s, sizeof(s), "GPU memory %u / %u MiB   ·   context %u tokens   ·   %s cached tokens served", v->gpu_used_mb,
+             v->gpu_total_mb, v->ctx, (srv_fmt_count(a, sizeof(a), v->tokens_cached), a));
+    draw_str(&font_small, 120, SCREEN_H - 120, s, C_TEXT_MUTED);
+    int fx = SCREEN_W - 120, fy = SCREEN_H - 120 + font_small.line / 2;
+    const char* lab = "Models";
+    fx -= str_width(&font_small, lab);
+    draw_str(&font_small, fx, SCREEN_H - 120, lab, C_TEXT_DIM);
+    draw_btn(BTN_TRIANGLE, fx - 54, fy);
+    const char* lq = "Hold: quit";
+    fx -= 54 + 40 + str_width(&font_small, lq);
+    draw_str(&font_small, fx, SCREEN_H - 120, lq, C_TEXT_DIM);
+    draw_btn(BTN_OPTIONS, fx - 70, fy);
+
+    // model picker over everything
+    if (v->picker) {
+        for (int i = 0; i < SCREEN_W * SCREEN_H; i++) {   // darken what is behind the panel
+            uint32_t c = back[i];
+            back[i] = 0x80000000u | (((c >> 16 & 255) * 2 / 5) << 16) | (((c >> 8 & 255) * 2 / 5) << 8) | ((c & 255) * 2 / 5);
+        }
+        int n = v->n_models, rowh = font.line + 30, w = 900, h = 170 + (n > 0 ? n : 1) * rowh + 90;
+        int x = (SCREEN_W - w) / 2, y = (SCREEN_H - h) / 2;
+        rrect(x, y, w, h, 24, C_PANEL, 250);
+        draw_str(&font_big, x + 50, y + 40, "Choose a model", C_TEXT);
+        if (n == 0) draw_str(&font, x + 50, y + 150, "No models in /data/garlic/models", C_TEXT_DIM);
+        for (int i = 0; i < n; i++) {
+            int ry = y + 140 + i * rowh;
+            if (i == v->sel) rrect(x + 30, ry - 8, w - 60, rowh - 6, 14, C_USER, 255);
+            draw_str(&font, x + 60, ry, v->models[i], C_TEXT);
+            if (i == v->current) {
+                const char* t = "loaded";
+                draw_str(&font_small, x + w - 70 - str_width(&font_small, t), ry + 6, t, C_GREEN);
+            }
+        }
+        int by = y + h - 60;
+        int bx = x + 50;
+        bx += draw_btn(BTN_CROSS, bx, by) + 10;
+        draw_str(&font_small, bx, by - font_small.line / 2, "Load (the server restarts)", C_TEXT_DIM);
+        bx += str_width(&font_small, "Load (the server restarts)") + 50;
+        bx += draw_btn(BTN_CIRCLE, bx, by) + 10;
+        draw_str(&font_small, bx, by - font_small.line / 2, "Close", C_TEXT_DIM);
+    }
+}

@@ -325,6 +325,7 @@ static size_t think_len;
 static uint32_t hist_ids[MAX_REPLY + 16];   // the turn as the model keeps it: an empty <think></think>, the answer
 static int hist_n, hist_done;
 static void start_turn(const char* user_text);
+static void raw_invalidate(void);   // api_run.inc: the /v1/raw prompt cache no longer matches the engine
 
 static void toast(StrId id) {
     toast_text = tr(id);
@@ -703,6 +704,7 @@ static void start_turn(const char* user_text) {
     static uint32_t ids[8192];   // (with what is left of a thought turn's answer, hist_ids)
     int n = 0, max = 8192, think = think_on && !in_voice_mode && eng.qwen35;
     think_t_ask = now();
+    raw_invalidate();   // (the engine leaves what a /v1/raw client had cached)
     sys_pre = 0;   // (a system prompt half read ahead is read again below)
     if (pos == 0) {
         engine_reset(&eng);   // a new conversation: clear the Gated DeltaNet states
@@ -1832,6 +1834,72 @@ static void api_toggle(void) {
 static int api_had_chat, api_step_n;
 static double api_step_t;
 
+#ifdef GARLIC_SERVER
+// ---- server mode dashboard (ui.c draw_server) -----------------------------------------------------------------------
+static ServerView sv;
+static double srv_last_draw, srv_spark_t;
+static char srv_names[16][64];
+static const char* srv_name_ptrs[16];
+
+static void srv_draw(int force) {
+    // A frame costs two 8 MB copies and a wait for vsync (present): while the model works, 2 frames per second (the
+    // numbers still move), so the screen takes almost nothing from generation; 10 when idle (the picker stays smooth)
+    double t = now(), gap = sv.state ? 0.5 : (sv.picker ? 1.0 / 30 : 0.1);
+    if (!force && t - srv_last_draw < gap) return;
+    srv_last_draw = t;
+    sv.address = api_address();
+    sv.gpu_used_mb = (unsigned)(eng.next >> 20), sv.gpu_total_mb = (unsigned)(eng.mem_size >> 20);
+    sv.ctx = eng.ctx_limit;
+    draw_server(&sv);
+    present();
+}
+
+static void srv_spark_push(float v) {
+    if (sv.n_spark == SRV_SPARK) memmove(sv.spark, sv.spark + 1, sizeof(float) * (SRV_SPARK - 1)), sv.n_spark--;
+    sv.spark[sv.n_spark++] = v;
+}
+
+static void api_chat_begin(void) {
+    sv.state = 1;
+    sv.generated_n = 0;
+    sv.tok_s = 0;
+    srv_draw(1);
+}
+
+static void api_chat_reply(void) {
+    sv.state = 2;
+    api_step_n = 0, api_step_t = now();
+    srv_spark_t = api_step_t;
+    srv_draw(1);
+}
+
+static int api_chat_step(int produced) {
+    double t = now(), dt = t - api_step_t;
+    int k = produced - api_step_n;
+    if (k > 0 && dt > 0) sv.tok_s = sv.tok_s ? sv.tok_s * 0.85f + 0.15f * (float)(k / dt) : (float)(k / dt);
+    api_step_n = produced, api_step_t = t;
+    sv.generated_n = produced;
+    if (t - srv_spark_t >= 0.5) {
+        srv_spark_t = t;
+        srv_spark_push(sv.tok_s);
+    }
+    srv_draw(0);
+    return (read_buttons() & ORBIS_PAD_BUTTON_CIRCLE) != 0;
+}
+
+static void api_chat_end(void) {
+    sv.state = 0;
+    srv_draw(1);
+#ifdef GARLIC_SPEC
+    if (spec_active(&eng)) {
+        char sl[300];
+        spec_stats(&eng, sl, sizeof(sl));
+        say("%s", sl);
+        spec_stats_reset();
+    }
+#endif
+}
+#else
 static void api_chat_begin(void) {
     api_had_chat = n_msgs > 0;
     msgs_clear();
@@ -1879,7 +1947,332 @@ static void api_chat_end(void) {
 #endif
 }
 
+#endif
+
 #include "api_run.inc"   // the OpenAI-compatible API's jobs on the model (api.c serves the requests)
+
+#ifdef GARLIC_SERVER
+// ---- server mode: models on the console's own storage ---------------------------------------------------------------
+// Models live in /data/garlic/models/<name>/ (weights + their model.idx / mtp.idx; kernels.bin and tokenizer.bin may
+// be there too, else the package's are used). /data/garlic/model.txt names the one to load (default "qwen3.5-9b").
+// New models come on a USB drive: garlic/manifest.txt lists "<name>/<file>" lines, the files sit in garlic/models/.
+// At start every listed file that is missing in /data (or has another size) is copied there; then the drive is not
+// needed any more. Reading the drive needs GoldHEN's sandbox escape (GoldHEN_Plugins_SDK sys_sdk_jailbreak =
+// orbis_syscall(500, GOLDHEN_SDK_CMD_JAILBREAK = 2, &backup); orbis_syscall is the indirect syscall 0).
+#define SRV_ROOT "/data/garlic"
+#define SRV_MODELS SRV_ROOT "/models"
+static char srv_model[64] = "qwen3.5-9b";
+static void srv_registry_add(const char* name, size_t L);
+static char srv_dir[160];
+
+struct gh_jailbreak_backup {
+    uint32_t cr_uid, cr_ruid, cr_rgid, cr_groups;
+    uint64_t cr_paid;
+    uint64_t cr_caps[2];
+    void *cr_prison, *fd_cdir, *fd_jdir, *fd_rdir;
+};
+// GOLDHEN_SDK_CMD_JAILBREAK (2) saves the sandbox in bk; GOLDHEN_SDK_CMD_UNJAILBREAK (3) puts it back. The app's own
+// files (/app0) are only at their usual paths inside the sandbox, so it goes back in as soon as the import is done.
+static struct gh_jailbreak_backup gh_bk;
+static long goldhen_sdk(long cmd) {
+    long ret;
+    __asm__ volatile("syscall\n\tjnb 1f\n\tmovq $-1, %%rax\n1:"
+                     : "=a"(ret)
+                     : "0"(0L), "D"(500L), "S"(cmd), "d"(&gh_bk)
+                     : "rcx", "r8", "r9", "r10", "r11", "memory", "cc");
+    return ret;
+}
+static long goldhen_jailbreak(void) { return goldhen_sdk(2); }
+static long goldhen_unjailbreak(void) { return goldhen_sdk(3); }
+
+static long long srv_size(const char* p) {
+    int f = open(p, O_RDONLY);
+    if (f < 0) return -1;
+    off_t n = lseek(f, 0, SEEK_END);
+    close(f);
+    return (long long)n;
+}
+
+// copies src to dst (through dst.part); progress over all files: done/total bytes. 0 on success.
+static int srv_copy(const char* src, const char* dst, long long* done, long long total, const char* title) {
+    char part[200];
+    snprintf(part, sizeof(part), "%s.part", dst);
+    int in = open(src, O_RDONLY), out = in >= 0 ? open(part, O_WRONLY | O_CREAT | O_TRUNC, 0666) : -1;
+    if (in < 0 || out < 0) {
+        if (in >= 0) close(in);
+        say("server: cannot copy %s -> %s", src, dst);
+        return -1;
+    }
+    enum { CHUNK = 8 << 20 };
+    uint8_t* buf = malloc(CHUNK);
+    int ok = buf != NULL;
+    for (;;) {
+        if (!ok) break;
+        ssize_t r = read(in, buf, CHUNK);
+        if (r == 0) break;
+        if (r < 0 || write(out, buf, (size_t)r) != r) {
+            ok = 0;
+            break;
+        }
+        *done += r;
+        loading((void*)title, total > 0 ? (float)((double)*done / (double)total) * 0.99f : 0.0f, NULL);
+    }
+    free(buf);
+    close(in);
+    close(out);
+    if (!ok || rename(part, dst)) {
+        unlink(part);
+        say("server: copy of %s failed", src);
+        return -1;
+    }
+    return 0;
+}
+
+// The manifest on a USB drive: copy what /data lacks.
+static void srv_import(void) {
+    static const char* const usb[] = {"/mnt/usb0", "/mnt/usb1", "/mnt/usb2", "/mnt/usb3"};
+    for (int u = 0; u < 4; u++) {
+        char man[96];
+        snprintf(man, sizeof(man), "%s/garlic/manifest.txt", usb[u]);
+        size_t n = 0;
+        char* m = (char*)read_all(man, &n);
+        if (!m) continue;
+        say("server: model manifest on %s (%zu bytes)", usb[u], n);
+        // two passes: sizes to copy (for the progress bar), then the copies
+        long long total = 0, done = 0;
+        int copies = 0, failed = 0;
+        for (int pass = 0; pass < 2; pass++) {
+            char* line = m;
+            while (line && *line) {
+                char* end = strchr(line, '\n');
+                if (end) *end = 0;
+                size_t L = strlen(line);
+                while (L && (line[L - 1] == '\r' || line[L - 1] == ' ')) line[--L] = 0;
+                char* slash = strchr(line, '/');
+                if (pass == 1 && L && line[0] != '#' && slash && !strstr(line, "..") && L < 120)
+                    srv_registry_add(line, (size_t)(slash - line));
+                if (L && line[0] != '#' && slash && !strstr(line, "..") && L < 120) {
+                    char src[200], dst[200], dir[200];
+                    snprintf(src, sizeof(src), "%s/garlic/models/%s", usb[u], line);
+                    snprintf(dst, sizeof(dst), SRV_MODELS "/%s", line);
+                    long long ss = srv_size(src), ds = srv_size(dst);
+                    if (ss < 0) {
+                        if (pass == 0) say("server: %s listed but missing", src);
+                    } else if (ds != ss) {
+                        if (pass == 0) {
+                            total += ss;
+                        } else {
+                            snprintf(dir, sizeof(dir), SRV_MODELS "/%.*s", (int)(slash - line), line);
+                            sceKernelMkdir(SRV_ROOT, 0777);
+                            sceKernelMkdir(SRV_MODELS, 0777);
+                            sceKernelMkdir(dir, 0777);
+                            say("server: copying %s (%.1f MiB) to the console", line, ss / 1048576.0);
+                            if (srv_copy(src, dst, &done, total, "Copying the model to the console")) failed++;
+                            else copies++;
+                        }
+                    }
+                }
+                if (end) *end = '\n';
+                line = end ? end + 1 : NULL;
+            }
+        }
+        say("server: import from %s: %d file(s) copied, %d failed (%.1f MiB)", usb[u], copies, failed,
+            done / 1048576.0);
+        free(m);
+    }
+}
+
+// The models the picker offers: /data/garlic/models.txt (one name per line), kept up to date by the import.
+static int srv_registry_load(void) {
+    int n = 0;
+    size_t len = 0;
+    char* t = (char*)read_all(SRV_ROOT "/models.txt", &len);
+    for (char* line = t; t && line && *line && n < 16;) {
+        char* end = strchr(line, '\n');
+        size_t L = end ? (size_t)(end - line) : strlen(line);
+        while (L && (line[L - 1] == '\r' || line[L - 1] == ' ')) L--;
+        if (L && L < 64 && line[0] != '#') {
+            int dup = 0;
+            for (int i = 0; i < n; i++) dup |= strlen(srv_names[i]) == L && !memcmp(srv_names[i], line, L);
+            if (!dup) memcpy(srv_names[n], line, L), srv_names[n][L] = 0, n++;
+        }
+        line = end ? end + 1 : NULL;
+    }
+    free(t);
+    return n;
+}
+
+static void srv_registry_add(const char* name, size_t L) {
+    int n = srv_registry_load();
+    for (int i = 0; i < n; i++)
+        if (strlen(srv_names[i]) == L && !memcmp(srv_names[i], name, L)) return;
+    int f = open(SRV_ROOT "/models.txt", O_WRONLY | O_CREAT | O_APPEND, 0666);
+    if (f < 0) return;
+    write(f, name, L);
+    write(f, "\n", 1);
+    close(f);
+    say("server: model \"%.*s\" added to the picker", (int)L, name);
+}
+
+static void srv_picker_fill(void) {
+    int n = srv_registry_load();
+    int cur = -1;
+    for (int i = 0; i < n; i++)
+        if (!strcmp(srv_names[i], srv_model)) cur = i;
+    if (cur < 0 && n < 16) {   // the current model, if it is installed but not listed
+        char idx[200];
+        snprintf(idx, sizeof(idx), SRV_MODELS "/%s/model.idx", srv_model);
+        if (srv_size(idx) > 0) strcpy(srv_names[n], srv_model), cur = n++;
+    }
+    for (int i = 0; i < n; i++) srv_name_ptrs[i] = srv_names[i];
+    sv.models = srv_name_ptrs, sv.n_models = n, sv.current = cur, sv.sel = cur;
+}
+
+// Saves the choice and starts the app again: the new model loads from the start.
+static void srv_switch(const char* name) {
+    int f = open(SRV_ROOT "/model.txt", O_WRONLY | O_CREAT | O_TRUNC, 0666);
+    if (f >= 0) {
+        write(f, name, strlen(name));
+        close(f);
+    }
+    if ((f = open(SRV_ROOT "/load_once.txt", O_WRONLY | O_CREAT | O_TRUNC, 0666)) >= 0) {   // (srv_start reads it)
+        write(f, name, strlen(name));
+        close(f);
+    }
+    static char note[120];
+    snprintf(note, sizeof(note), "Loading %s ...", name);
+    sv.note = note, sv.picker = 0;
+    srv_draw(1);
+    say("server: switching to model \"%s\" (the app starts again)", name);
+    const char* args[] = {NULL};
+    int r = sceSystemServiceLoadExec("/app0/eboot.bin", args);
+    snprintf(note, sizeof(note), "Could not restart (0x%08x): close and open Garlic Server to load %s", (unsigned)r, name);
+    srv_draw(1);
+}
+
+// Quit (OPTIONS held about a second): stop the API, give the GPU memory back, close the app (back to the home screen,
+// memory free for a game). The system frees everything an app had when it ends; this only makes it one button.
+static void srv_quit(void) {
+    static char note[80];
+    snprintf(note, sizeof(note), "Unloading %s and closing ...", sv.model ? sv.model : "the model");
+    sv.note = note, sv.picker = 0, sv.state = 0;
+    srv_draw(1);
+    say("server: quit from the dashboard");
+    api_enable(0);
+    if (eng.mem) sceKernelMunmap(eng.mem, eng.mem_size);   // (the block goes back with the process anyway)
+    const char* args[] = {NULL};
+    sceSystemServiceLoadExec("exit", args);
+    exit(0);
+}
+
+// The picker on its own (the model did not load, or between requests): Triangle opens it, Up/Down, Cross, Circle.
+static uint32_t srv_prev_buttons;
+static double srv_opt_t0;
+static void srv_picker_input(void) {
+    uint32_t b = read_buttons(), pressed = b & ~srv_prev_buttons;
+    srv_prev_buttons = b;
+    if (b & ORBIS_PAD_BUTTON_OPTIONS) {   // held for a second: quit
+        if (!srv_opt_t0) srv_opt_t0 = now();
+        else if (now() - srv_opt_t0 > 1.0) srv_quit();
+    } else {
+        srv_opt_t0 = 0;
+    }
+    if (sv.picker) {
+        if ((pressed & ORBIS_PAD_BUTTON_UP) && sv.sel > 0) sv.sel--;
+        if ((pressed & ORBIS_PAD_BUTTON_DOWN) && sv.sel < sv.n_models - 1) sv.sel++;
+        if (pressed & ORBIS_PAD_BUTTON_CIRCLE) sv.picker = 0;
+        if ((pressed & ORBIS_PAD_BUTTON_CROSS) && sv.n_models > 0) {
+            if (sv.sel != sv.current) srv_switch(sv.models[sv.sel]);
+            else sv.picker = 0;
+        }
+    } else if (pressed & ORBIS_PAD_BUTTON_TRIANGLE) {
+        srv_picker_fill();
+        sv.picker = 1;
+    }
+}
+
+static void srv_failed(const char* error) {
+    static char note[240];
+    snprintf(note, sizeof(note), "%s could not be loaded: %s", srv_model, error);
+    say("server: %s", note);
+    sv.note = note;
+    sv.model = srv_model;
+    srv_picker_fill();
+    sv.picker = 1;
+    for (;;) {
+        srv_picker_input();
+        srv_draw(0);
+        sceKernelUsleep(16000);
+    }
+}
+
+// Which model: /data/garlic/model.txt, else the default. Its folder becomes the engine's model folder if it holds a
+// model.idx.
+static void srv_set_model(const char* name) {
+    if (name != srv_model) snprintf(srv_model, sizeof(srv_model), "%s", name);
+    snprintf(srv_dir, sizeof(srv_dir), SRV_MODELS "/%s", srv_model);
+    char idx[200];
+    snprintf(idx, sizeof(idx), "%s/model.idx", srv_dir);
+    engine_model_dir = srv_size(idx) > 0 ? srv_dir : NULL;
+}
+
+static int srv_read_name(const char* path, char* out, size_t cap) {
+    size_t n = 0;
+    char* t = (char*)read_all(path, &n);
+    if (!t) return 0;
+    size_t i = 0;
+    while (i < n && i < cap - 1 && t[i] != '\n' && t[i] != '\r' && t[i] != ' ') i++;
+    memcpy(out, t, i);
+    out[i] = 0;
+    free(t);
+    return i > 0;
+}
+
+// Which model to load. After a switch from the dashboard (load_once.txt): that one, at once. Otherwise the picker
+// opens first (the last model loaded is selected) and nothing loads until Cross.
+static void srv_start(void) {
+    char name[64];
+    if (srv_read_name(SRV_ROOT "/model.txt", name, sizeof(name))) srv_set_model(name);
+    else srv_set_model(srv_model);
+    if (srv_read_name(SRV_ROOT "/load_once.txt", name, sizeof(name))) {
+        unlink(SRV_ROOT "/load_once.txt");
+        srv_set_model(name);
+        say("server: loading \"%s\" (chosen before the restart)", srv_model);
+        return;
+    }
+    srv_picker_fill();
+    if (sv.n_models == 0) {
+        say("server: no models in " SRV_MODELS "; loading \"%s\"", srv_model);
+        return;
+    }
+    static char note[96];
+    snprintf(note, sizeof(note), "%d model%s installed: choose one to load", sv.n_models, sv.n_models == 1 ? "" : "s");
+    sv.note = note;
+    sv.model = "(none loaded)";
+    sv.picker = 1;
+    sv.current = -1;
+    srv_prev_buttons = read_buttons();
+    say("server: waiting for a model to be chosen (%d installed)", sv.n_models);
+    for (;;) {
+        uint32_t bt = read_buttons(), pressed = bt & ~srv_prev_buttons;
+        srv_prev_buttons = bt;
+        if ((pressed & ORBIS_PAD_BUTTON_UP) && sv.sel > 0) sv.sel--;
+        if ((pressed & ORBIS_PAD_BUTTON_DOWN) && sv.sel < sv.n_models - 1) sv.sel++;
+        if (pressed & ORBIS_PAD_BUTTON_CROSS) break;
+        srv_draw(0);
+        sceKernelUsleep(16000);
+    }
+    srv_set_model(sv.models[sv.sel]);
+    int f = open(SRV_ROOT "/model.txt", O_WRONLY | O_CREAT | O_TRUNC, 0666);
+    if (f >= 0) {
+        write(f, srv_model, strlen(srv_model));
+        close(f);
+    }
+    sv.picker = 0;
+    sv.note = NULL;
+    say("server: model \"%s\" chosen", srv_model);
+}
+#endif
 
 int main(void) {
     if (rename(LOG_FILE, LOG_PREV)) unlink(LOG_FILE);   // the last log of this app is kept, as LOG_PREV
@@ -1907,21 +2300,89 @@ int main(void) {
     sceSystemServiceHideSplashScreen();   // the system shows pic1.png until the app says it is drawing
     say("video and fonts ready");
     loading((void*)tr(S_PREPARING), 0.0f, NULL);
+    const char* tok_file = ASSETS "/tokenizer.bin";
+#ifdef GARLIC_SERVER
+    long jb = goldhen_jailbreak();
+    say("server: GoldHEN sandbox escape %s (%ld)", jb == 0 ? "ok" : "failed: USB import unavailable", jb);
+    if (jb == 0) {
+        srv_import();
+        long uj = goldhen_unjailbreak();
+        say("server: back in the sandbox %s (%ld)", uj == 0 ? "ok" : "FAILED", uj);
+    }
+    srv_start();
+    say("server: model \"%s\" from %s", srv_model, engine_model_dir ? srv_dir : "the package (no model folder)");
+    api_set_name(srv_model);
+    static char tok_model[200];
+    snprintf(tok_model, sizeof(tok_model), "%s/tokenizer.bin", srv_dir);
+    if (engine_model_dir && srv_size(tok_model) > 0) tok_file = tok_model;
+#endif
     size_t tsize;
-    uint8_t* tdata = read_all(ASSETS "/tokenizer.bin", &tsize);
+    uint8_t* tdata = read_all(tok_file, &tsize);
     if (!tdata || tok_load(&tok, tdata, tsize)) show_error("tokenizer.bin");
     say("tokenizer: %u tokens", tok.n_vocab);
     eng_margin_mb = 64 - ui_screen_pool_mb();   // (the screen block came out of the system's 64 MiB)
     const char* eng_assets = ASSETS;
+#ifdef GARLIC_SERVER
+    if (engine_init(&eng, eng_assets, loading, (void*)tr(S_LOADING_MODEL))) srv_failed(eng.error);
+#else
     if (engine_init(&eng, eng_assets, loading, (void*)tr(S_LOADING_MODEL))) show_error(eng.error);
+#endif
     say("language model ready; GPU memory used %u of %u MiB; context cache %s, %u tokens (%u while voice mode "
         "borrows %u MiB)", (unsigned)(eng.next >> 20), (unsigned)(eng.mem_size >> 20),
         eng.tq ? "TurboQuant 4-bit" : "fp16 k + int8 v", eng.max_seq, eng.lend_ctx, (unsigned)(eng.kv_split >> 20));
+#ifdef GARLIC_SERVER
+    // Server mode: the console is only an inference engine for clients on the network (/v1/raw, /v1/chat/completions).
+    // No voice, no dictation: their GPU memory goes to the MTP head (its own block instead of T3's) and to the
+    // /v1/raw prompt cache's state copy; the context keeps its whole length (nothing borrows kv_hi).
+    if (!eng.maple && spec_init(&eng, eng_assets) == 0) {
+        uint64_t sz = 0, base = 0;
+        for (uint64_t mb = 256; mb >= 224 && !base; mb -= 8) base = engine_alloc(&eng, (sz = mb << 20));
+        if (base && spec_load(&eng, base, sz, 0) == 0) {
+            spec_lent = 1;
+            say("server: MTP head in its own %u MiB", (unsigned)(sz >> 20));
+        } else {
+            say("server: no room for the MTP head (one token per step)");
+        }
+    } else {
+        say("server: no MTP head (mtp.idx, the q4s model or a kernel missing)");
+    }
+    raw_snap = engine_alloc(&eng, engine_state_size(&eng));
+    say("server: prompt cache state copy %s (%.1f MiB); GPU memory used %u of %u MiB; context %u tokens",
+        raw_snap ? "ready" : "NOT available", engine_state_size(&eng) / 1048576.0, (unsigned)(eng.next >> 20),
+        (unsigned)(eng.mem_size >> 20), eng.ctx_limit);
+    if (raw_snap) raw_sys = engine_alloc(&eng, engine_state_size(&eng));
+    say("server: system prompt cache copy %s; GPU memory used %u of %u MiB", raw_sys ? "ready" : "NOT available",
+        (unsigned)(eng.next >> 20), (unsigned)(eng.mem_size >> 20));
+    view.temperature = 0.7f;
+    api_set_model(engine_model_dir ? srv_model : MODEL_NAME);
+    if (api_enable(1)) say("server: the API could not be turned on");
+    else say("server: API on %s (POST /v1/raw, /v1/chat/completions)", api_address());
+    sv.model = engine_model_dir ? srv_model : MODEL_NAME;
+    srv_picker_fill();
+    srv_registry_add(srv_model, strlen(srv_model));
+    for (;;) {   // requests from the network; Triangle: the model picker
+        ApiJob* job = sv.picker ? NULL : api_take();
+        if (job) {
+            if (job->raw) api_raw_job(job);
+            else {
+                raw_invalidate();
+                api_job(job);
+            }
+            api_done(job);
+            srv_prev_buttons = read_buttons();
+        }
+        srv_picker_input();
+        srv_draw(0);
+        if (!job) sceKernelUsleep(16000);
+    }
+#else
     if (t3_init(&eng, ASSETS) == 0) {   // text to speech, first half (Chatterbox T3)
         say("T3 ready; GPU memory used %u of %u MiB", (unsigned)(eng.next >> 20), (unsigned)(eng.mem_size >> 20));
     } else {
         say("T3 not loaded: %s", eng.error);
     }
+#endif
+#ifndef GARLIC_SERVER
     loading((void*)tr(S_LOADING_VOICE), 0.99f, NULL);
     if (asr_init(&eng, ASSETS) == 0)
         say("speech to text ready: up to %u s of audio", eng.asr.max_frames * 8 / 100);
@@ -1944,13 +2405,19 @@ int main(void) {
     think_config();
     api_set_model(MODEL_NAME);
     api_config();   // the OpenAI-compatible API (api.h), if it was left on; its jobs run in the loop below
+#endif
 
     uint32_t prev = 0;
     int scroll_held = 0;
     for (;;) {
         ApiJob* api_job_now = !generating && !in_voice_mode ? api_take() : NULL;
         if (api_job_now) {   // an API request: the model answers it now, the chat waits
-            api_job(api_job_now);
+            if (api_job_now->raw) {
+                api_raw_job(api_job_now);
+            } else {
+                raw_invalidate();
+                api_job(api_job_now);
+            }
             api_done(api_job_now);
             prev = read_buttons();   // (a button still held from the wait is not a new press)
         }
@@ -1982,6 +2449,7 @@ int main(void) {
             pos = 0;
             need_close = 0;
             view.scroll = 0;
+            raw_invalidate();
         }
         else if (pressed & (ORBIS_PAD_BUTTON_R3 | ORBIS_PAD_BUTTON_TOUCH_PAD)) think_toggle();
         else if ((pressed & ORBIS_PAD_BUTTON_L3) && !(buttons & PAD_DIRS)) api_toggle();   // (not while scrolling)

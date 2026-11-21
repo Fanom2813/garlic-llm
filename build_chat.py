@@ -23,12 +23,17 @@ PKGDIR = OUT / "pkg"
 if "--4b" in sys.argv:
     TITLE, VERSION, TITLE_ID, SUFFIX = "Garlic LLM 4B", "1.17", "PSAI00002", "02"
     REMOTE = "/data/pkg/Garlic-LLM-4B.pkg"
+elif "--server" in sys.argv:   # server mode (chat/main.c GARLIC_SERVER): inference engine for clients on the network
+    TITLE, VERSION, TITLE_ID, SUFFIX = "Garlic Server", "1.22", "PSAI00003", "03"
+    REMOTE = "/data/pkg/Garlic-Server.pkg"
 else:
     TITLE, VERSION, TITLE_ID, SUFFIX = "Garlic LLM", "1.20", "PSAI00001", "01"
     REMOTE = "/data/pkg/Garlic-LLM.pkg"
 FULL = "--full" in sys.argv
 # the weights of the all-in-one package (the names the .idx files give, see weights_locate)
 FULL_MODELS = (["qwen3.5-4b-q4i.bin"] if "--4b" in sys.argv else ["qwen3.5-9b-q4s.bin", "qwen3.5-9b-mtp.bin"]) +     ["parakeet-v3-q4i.bin", "chatterbox-t3.bin", "chatterbox-s3gen-mf.bin"]
+if "--server" in sys.argv:   # no voice, no dictation: only the language model and its MTP head
+    FULL_MODELS = ["qwen3.5-9b-q4s.bin", "qwen3.5-9b-mtp.bin"]
 CONTENT_ID = f"IV0000-{TITLE_ID}_00-PS4LOCALAICHAT{SUFFIX}"
 SOURCES = sorted((ROOT / "chat").glob("*.c"))
 MP = ROOT / "chat" / "py" / "mp"
@@ -47,7 +52,7 @@ def compile_all():
     config = max(p.stat().st_mtime for p in (ROOT / "chat" / "py").glob("*.h"))
     jobs = []
     for src in SOURCES:
-        model = ["-DGARLIC_4B"] if "--4b" in sys.argv else []
+        model = ["-DGARLIC_4B"] if "--4b" in sys.argv else ["-DGARLIC_SERVER"] if "--server" in sys.argv else []
         jobs.append((src, objdir / (src.stem + ".o"), [*b.CFLAGS, *MP_FLAGS[:2], *model], True))
     for src in MP_SOURCES:
         obj = objdir / ("mp_" + src.parent.name + "_" + src.stem + ".o")
@@ -57,7 +62,7 @@ def compile_all():
     for src, obj, flags, needed in jobs:
         if not needed:
             continue
-        running.append((src, subprocess.Popen([str(b.ZIG), "cc", *map(str, flags), str(src), "-o", str(obj)], env=b.ENV)))
+        running.append((src, subprocess.Popen([str(b.ZIG), "clang", *map(str, flags), str(src), "-o", str(obj)], env=b.ENV)))
         if len(running) >= 8:
             for s, p in running:
                 if p.wait():
@@ -103,7 +108,7 @@ def main():
     elf = OUT / "ps4ai.elf"
     b.run([b.ZIG, "ld.lld", "-m", "elf_x86_64", "-pie", "--script", b.OO / "link.x", "--eh-frame-hdr", *objs,
            "-L", b.OO / "lib", *LIBS, b.OO / "lib" / "crt1.o", "-o", elf])
-    b.run([b.BIN / f"create-fself{b.EXE}", f"-in={elf}", f"-out={OUT / 'ps4ai.oelf'}", f"--eboot={PKGDIR / 'eboot.bin'}",
+    b.run([b.FSELF, f"-in={elf}", f"-out={OUT / 'ps4ai.oelf'}", f"--eboot={PKGDIR / 'eboot.bin'}",
            "--paid", "0x3800000000000011"])
     sample = b.OO / "samples" / "hello_world"
     shutil.copy(sample / "sce_sys" / "about" / "right.sprx", PKGDIR / "sce_sys" / "about")

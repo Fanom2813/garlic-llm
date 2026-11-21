@@ -23,6 +23,8 @@
 // Socket constants that the SDK's headers do not name (the BSD values the console's libSceNet uses)
 #define API_SOL_SOCKET 0xffff
 #define API_SO_REUSEADDR 0x0004
+#define API_SO_BROADCAST 0x0020
+#define API_BEACON_PORT 8099   // UDP: "GARLIC1 <port> <model>" every 2 s while the API is on (the Mac finds the console)
 #define API_SO_RCVTIMEO 0x1006
 #define API_SO_SNDTIMEO 0x1005
 #define API_IPPROTO_TCP 6
@@ -133,16 +135,39 @@ static int read_request(int fd, char** buf_out, size_t* len_out, HttpRequest* re
     return r == 0 ? 0 : -1;
 }
 
-static void serve_chat(int fd, HttpRequest* req) {
-    JNode* pool = malloc(sizeof(JNode) * API_MAX_NODES);
+// A /v1/raw body (api_run.inc reads it): "GRW1", then little-endian uint32 n_tokens, max_new, float temperature,
+// uint32 seed, n_stop, flags; then n_stop stop ids and n_tokens prompt ids. Checks only the sizes here.
+static int raw_body_ok(const HttpRequest* req) {
+    if (req->body_len < 28 || memcmp(req->body, "GRW1", 4)) return 0;
+    uint32_t h[6];
+    memcpy(h, req->body + 4, sizeof(h));
+    uint64_t need = 28 + 4ull * h[4] + 4ull * h[0];
+    return h[0] > 0 && h[0] <= 65536 && h[4] <= 64 && need == req->body_len;
+}
+
+static void serve_job(int fd, HttpRequest* req, int raw);
+
+static void serve_chat(int fd, HttpRequest* req) { serve_job(fd, req, 0); }
+
+static void serve_job(int fd, HttpRequest* req, int raw) {
     ChatRequest cr;
-    const char* err = NULL;
-    if (!pool || api_chat_parse(req->body, req->body_len, pool, API_MAX_NODES, &cr, &err)) {
+    cr.stream = 1;
+    if (raw) {
+        if (!raw_body_ok(req)) {
+            reply_json_error(fd, 400, "Bad Request", "Malformed raw request.", "invalid_request_error", "invalid_body");
+            return;
+        }
+    } else {
+        JNode* pool = malloc(sizeof(JNode) * API_MAX_NODES);
+        const char* err = NULL;
+        if (!pool || api_chat_parse(req->body, req->body_len, pool, API_MAX_NODES, &cr, &err)) {
+            free(pool);
+            reply_json_error(fd, 400, "Bad Request", err ? err : "Out of memory.", "invalid_request_error",
+                             "invalid_body");
+            return;
+        }
         free(pool);
-        reply_json_error(fd, 400, "Bad Request", err ? err : "Out of memory.", "invalid_request_error", "invalid_body");
-        return;
     }
-    free(pool);
     ApiJob* job = calloc(1, sizeof(ApiJob));
     char* body = malloc(req->body_len + 1);
     if (!job || !body) {
@@ -156,6 +181,7 @@ static void serve_chat(int fd, HttpRequest* req) {
     job->fd = fd;
     job->body = body;
     job->body_len = req->body_len;
+    job->raw = raw;
     scePthreadMutexLock(&api_mu);
     int full = busy;
     if (!full) {
@@ -170,7 +196,7 @@ static void serve_chat(int fd, HttpRequest* req) {
                          "busy");
         return;
     }
-    say("api: chat request, %zu bytes, %s", req->body_len, cr.stream ? "streamed" : "whole reply");
+    say("api: %s request, %zu bytes, %s", raw ? "raw" : "chat", req->body_len, cr.stream ? "streamed" : "whole reply");
     // the main loop writes the reply to fd; the connection is closed here once it is written
     while (!job->done) sceKernelUsleep(5000);
     free(job->body);
@@ -213,6 +239,10 @@ static void handle(int fd) {
         if (spec) reply(fd, 200, "OK", "application/json", (const char*)spec, n);
         else reply_json_error(fd, 404, "Not Found", "The API description is missing.", "invalid_request_error", NULL);
         free(spec);
+    } else if (!strcmp(req.method, "POST") && !strcmp(req.path, "/v1/raw")) {
+        serve_job(fd, &req, 1);
+        free(buf);
+        return;
     } else if (!strcmp(req.method, "POST") && !strcmp(req.path, "/v1/chat/completions")) {
         serve_chat(fd, &req);
         free(buf);
@@ -337,6 +367,53 @@ static void find_address(void) {
     sceNetSocketClose(s);
 }
 
+// The announcement: the console's address changes (DHCP), so while the API is on it says where it is, to the
+// broadcast address and to the /24 one of its own address. Only the program's own state goes out: port and model name.
+static char beacon_name[64];
+static int have_beacon;
+static OrbisPthread beacon_th;
+
+void api_set_name(const char* name) { snprintf(beacon_name, sizeof(beacon_name), "%s", name ? name : ""); }
+
+static void* beacon_main(void* arg) {
+    (void)arg;
+    OrbisNetId s = -1;
+    for (;;) {
+        if (on) {
+            if (s < 0) {
+                s = sceNetSocket("garlic_beacon", ORBIS_NET_AF_INET, ORBIS_NET_SOCK_DGRAM, API_IPPROTO_UDP);
+                if (s >= 0) {
+                    int one = 1;
+                    sceNetSetsockopt(s, API_SOL_SOCKET, API_SO_BROADCAST, &one, sizeof(one));
+                }
+            }
+            if (s >= 0) {
+                char msg[128];
+                int n = snprintf(msg, sizeof(msg), "GARLIC1 %d %s\n", API_PORT, beacon_name);
+                uint8_t dst[2][4] = {{255, 255, 255, 255}, {0, 0, 0, 0}};
+                unsigned a0, a1, a2, a3;
+                int nd = 1;
+                if (sscanf(address, "%u.%u.%u.%u", &a0, &a1, &a2, &a3) == 4) {
+                    dst[1][0] = (uint8_t)a0, dst[1][1] = (uint8_t)a1, dst[1][2] = (uint8_t)a2, dst[1][3] = 255;
+                    nd = 2;
+                }
+                for (int i = 0; i < nd; i++) {
+                    ApiSockaddrIn a;
+                    memset(&a, 0, sizeof(a));
+                    a.len = sizeof(a);
+                    a.family = ORBIS_NET_AF_INET;
+                    a.port = sceNetHtons(API_BEACON_PORT);
+                    memcpy(&a.addr, dst[i], 4);
+                    sceNetSendto(s, msg, (size_t)n, 0, (const OrbisNetSockaddr*)&a, sizeof(a));
+                }
+            }
+        }
+        sceKernelUsleep(2000000);
+        if (on && (address[0] == ':')) find_address();   // (no network yet when the API came on)
+    }
+    return NULL;
+}
+
 int api_enabled(void) { return on; }
 
 const char* api_address(void) { return address; }
@@ -374,6 +451,12 @@ int api_enable(int want) {
             return -1;
         }
         have_thread = 1;
+    }
+    if (!have_beacon) {
+        OrbisPthreadAttr attr;
+        scePthreadAttrInit(&attr);
+        scePthreadAttrSetstacksize(&attr, 64 << 10);
+        have_beacon = scePthreadCreate(&beacon_th, &attr, beacon_main, NULL, "garlic_beacon") == 0;
     }
     find_address();
     say("api: OpenAI-compatible API on %s%s", address, key ? " (API key required)" : "");
