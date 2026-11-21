@@ -123,12 +123,24 @@ FOUND = {"beacon_t": 0.0, "scan_t": 0.0}
 
 
 IGNORED = set()
+SWITCH = threading.Lock()   # one check of the current console at a time
 
 
 def set_ps4(host, port, why):
     # Announcements and scan results are not authenticated (anyone on the network could answer or announce): another
     # address is only taken when the current console, asked right now, does not answer.
-    if PS4B and PS4B.host and (PS4B.host, PS4B.port) != (host, port) and probe(PS4B.host, PS4B.port):
+    if PS4B and PS4B.host and (PS4B.host, PS4B.port) != (host, port):
+        if PS4B.lock.locked() or not SWITCH.acquire(blocking=False):
+            return   # (mid-request the console may not answer; one check at a time)
+        try:   # three checks over ~4 s must all fail before a working console is given up
+            alive = any(probe(PS4B.host, PS4B.port) or (time.sleep(2) and False) for _ in range(3))
+        finally:
+            SWITCH.release()
+        if PS4B.lock.locked():
+            return
+    else:
+        alive = False
+    if alive:
         if host not in IGNORED:
             IGNORED.add(host)
             sys.stderr.write(f"[ps4] ignoring an announcement from {host}:{port} while {PS4B.host} answers\n")

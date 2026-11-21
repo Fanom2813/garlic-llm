@@ -41,6 +41,7 @@ public final class Backend: @unchecked Sendable {
     var beaconAt = Date.distantPast
     var scanAt = Date.distantPast
     var scanning = false
+    var switchChecking = false
     var ignored = Set<String>()   // addresses whose announcements were ignored (logged once)
     let fixed: Bool
     // the token-exact text of the last exchange, so the next prompt reuses its ids (keeps the console's cache hitting)
@@ -131,9 +132,25 @@ public final class Backend: @unchecked Sendable {
         lock.unlock()
         guard let (ch, cp) = cur else { setConsole(host, port, how: how); return }
         if busy { return }   // (mid-request the console may be too busy to answer the check: never switch then)
+        lock.lock()
+        let checking = switchChecking
+        switchChecking = true
+        lock.unlock()
+        if checking { return }   // (one check at a time; a flood of announcements starts nothing more)
         Thread.detachNewThread { [weak self] in
             guard let self else { return }
-            if let (code, _) = httpGet(host: ch, port: cp, path: "/v1/models", timeout: 2), code == 200 {
+            defer { self.lock.lock(); self.switchChecking = false; self.lock.unlock() }
+            // three checks over ~4 s must all fail before a console that worked is given up
+            var alive = false
+            for i in 0 ..< 3 where !alive {
+                if i > 0 { Thread.sleep(forTimeInterval: 2) }
+                if let (code, _) = httpGet(host: ch, port: cp, path: "/v1/models", timeout: 2), code == 200 { alive = true }
+            }
+            self.lock.lock()
+            let nowBusy = self.snap.busy, moved = self.snap.host != ch
+            self.lock.unlock()
+            if nowBusy || moved { return }
+            if alive {
                 self.lock.lock()
                 let first = self.ignored.insert(host).inserted
                 self.lock.unlock()
