@@ -110,14 +110,8 @@ public final class Backend: @unchecked Sendable {
                 self.lock.lock()
                 self.beaconAt = Date()
                 let changed = self.snap.host != host || self.snap.port != port
-                // Announcements are not authenticated: while the current console answers, another address announcing
-                // itself is ignored (anyone on the network could send one and receive the prompts).
-                let keep = changed && self.snap.host != nil && self.snap.reachable
-                let first = keep && !self.ignored.contains(host)
-                if first { self.ignored.insert(host) }
                 self.lock.unlock()
-                if first { self.log("ignoring an announcement from \(host):\(port) while the console at \(self.snap.host ?? "") answers") }
-                if changed && !keep { self.setConsole(host, port, how: "announcement" + (model.isEmpty ? "" : ", model \(model)")) }
+                if changed { self.switchConsole(host, port, how: "announcement" + (model.isEmpty ? "" : ", model \(model)")) }
             }, failed: { [weak self] msg in self?.log("announcements: \(msg); finding the console by scanning") })
             scan()
         }
@@ -126,6 +120,27 @@ public final class Backend: @unchecked Sendable {
                 self.checkConsole()
                 Thread.sleep(forTimeInterval: 5)
             }
+        }
+    }
+
+    /// Announcements and scan results are not authenticated (anyone on the network could send one and receive the
+    /// prompts): another address is only taken when the current console, asked right now, does not answer.
+    func switchConsole(_ host: String, _ port: Int, how: String) {
+        lock.lock()
+        let cur = snap.host.map { ($0, snap.port) }, busy = snap.busy
+        lock.unlock()
+        guard let (ch, cp) = cur else { setConsole(host, port, how: how); return }
+        if busy { return }   // (mid-request the console may be too busy to answer the check: never switch then)
+        Thread.detachNewThread { [weak self] in
+            guard let self else { return }
+            if let (code, _) = httpGet(host: ch, port: cp, path: "/v1/models", timeout: 2), code == 200 {
+                self.lock.lock()
+                let first = self.ignored.insert(host).inserted
+                self.lock.unlock()
+                if first { self.log("ignoring \(how) from \(host):\(port): the console at \(ch) still answers") }
+                return
+            }
+            self.setConsole(host, port, how: how)
         }
     }
 
@@ -158,7 +173,7 @@ public final class Backend: @unchecked Sendable {
             let same = found != nil && self.snap.host == found
             self.lock.unlock()
             if let h = found {
-                if !same { self.setConsole(h, 8080, how: "network scan") }
+                if !same { self.switchConsole(h, 8080, how: "network scan") }
             } else {
                 self.log("scan: no Garlic Server on " + localSubnets().map { $0 + ".x" }.joined(separator: ", "))
             }

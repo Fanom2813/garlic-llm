@@ -88,7 +88,6 @@ def current_model():
         c.request("GET", "/v1/models")
         name = json.loads(c.getresponse().read())["data"][0]["id"]
         c.close()
-        LAST_OK["t"] = now
         if not re.fullmatch(r"[A-Za-z0-9._-]{1,64}", str(name)) or ".." in name:   # (a folder name, never a path)
             name = None
     except (OSError, ValueError, KeyError, IndexError, http.client.HTTPException):
@@ -123,13 +122,13 @@ BEACON_PORT = 8099
 FOUND = {"beacon_t": 0.0, "scan_t": 0.0}
 
 
-LAST_OK = {"t": 0.0}   # when the current console last answered
 IGNORED = set()
 
 
 def set_ps4(host, port, why):
-    if PS4B and (PS4B.host, PS4B.port) != (host, port) and why.startswith("announcement") and time.time() - LAST_OK["t"] < 15:
-        # announcements are not authenticated: keep a console that answers (anyone on the network could announce)
+    # Announcements and scan results are not authenticated (anyone on the network could answer or announce): another
+    # address is only taken when the current console, asked right now, does not answer.
+    if PS4B and PS4B.host and (PS4B.host, PS4B.port) != (host, port) and probe(PS4B.host, PS4B.port):
         if host not in IGNORED:
             IGNORED.add(host)
             sys.stderr.write(f"[ps4] ignoring an announcement from {host}:{port} while {PS4B.host} answers\n")
