@@ -119,6 +119,11 @@ When a prompt does not fit the context, the companion answers HTTP 400 with the 
 
 Maple is a small model (1B active parameters). With shell access it will sometimes run commands that make no sense. In testing, it uninstalled the very agent that was driving it (`brew uninstall`). Turn on your agent's command approval, work in a project folder, and give it narrow tasks.
 
+## Security notes
+
+- The companion API listens on `127.0.0.1` only, sends no CORS headers (a web page cannot use it), and refuses requests whose `Host` is not `127.0.0.1` or `localhost` (DNS rebinding).
+- The console's port 8080 and its UDP announcement have **no authentication**: use them on a network you trust. Someone on the same network can talk to the console, or announce a fake one. While the current console answers, the companions ignore announcements from other addresses and log them. A newly found console is only used when the old one stops answering. To pin the address: `defaults write local.garlic.mac ps4 <ip>` or `proxy.py --ps4 http://<ip>:8080`.
+
 ## Performance notes (base PS4, Maple)
 
 | | |

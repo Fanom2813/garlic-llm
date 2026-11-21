@@ -22,11 +22,6 @@ public final class API: @unchecked Sendable {
 
     public func handle(_ req: Request, _ r: Responder) {
         let path = String(req.path.split(separator: "?", maxSplits: 1).first ?? "")
-        if req.method == "OPTIONS" {
-            r.send(204, contentType: "text/plain", body: Data(), extra: [("Access-Control-Allow-Headers", "*"),
-                                                                          ("Access-Control-Allow-Methods", "GET, POST, OPTIONS")])
-            return
-        }
         if req.method == "GET" {
             switch path {
             case "/v1/models", "/models":

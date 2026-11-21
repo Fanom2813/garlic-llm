@@ -41,6 +41,7 @@ public final class Backend: @unchecked Sendable {
     var beaconAt = Date.distantPast
     var scanAt = Date.distantPast
     var scanning = false
+    var ignored = Set<String>()   // addresses whose announcements were ignored (logged once)
     let fixed: Bool
     // the token-exact text of the last exchange, so the next prompt reuses its ids (keeps the console's cache hitting)
     var lastText: String?
@@ -109,8 +110,14 @@ public final class Backend: @unchecked Sendable {
                 self.lock.lock()
                 self.beaconAt = Date()
                 let changed = self.snap.host != host || self.snap.port != port
+                // Announcements are not authenticated: while the current console answers, another address announcing
+                // itself is ignored (anyone on the network could send one and receive the prompts).
+                let keep = changed && self.snap.host != nil && self.snap.reachable
+                let first = keep && !self.ignored.contains(host)
+                if first { self.ignored.insert(host) }
                 self.lock.unlock()
-                if changed { self.setConsole(host, port, how: "announcement" + (model.isEmpty ? "" : ", model \(model)")) }
+                if first { self.log("ignoring an announcement from \(host):\(port) while the console at \(self.snap.host ?? "") answers") }
+                if changed && !keep { self.setConsole(host, port, how: "announcement" + (model.isEmpty ? "" : ", model \(model)")) }
             }, failed: { [weak self] msg in self?.log("announcements: \(msg); finding the console by scanning") })
             scan()
         }
@@ -180,6 +187,9 @@ public final class Backend: @unchecked Sendable {
     // ---- models ----
 
     func folder(for name: String) -> URL? {
+        // (the name comes from the console: only a plain folder name, never a path)
+        guard !name.isEmpty, name.count <= 64, !name.contains(".."),
+              name.allSatisfy({ $0.isASCII && ($0.isLetter || $0.isNumber || "._-".contains($0)) }) else { return nil }
         var n = name
         while true {   // "maple-fast" -> "maple-fast", then "maple"
             for d in modelDirs {

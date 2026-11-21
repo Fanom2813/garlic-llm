@@ -37,7 +37,8 @@ public final class Responder: @unchecked Sendable {
 
     func head(_ code: Int, _ headers: [(String, String)]) -> Data {
         var s = "HTTP/1.1 \(code) \(Responder.reason(code))\r\n"
-        for (k, v) in headers + [("Access-Control-Allow-Origin", "*"), ("Connection", "close")] { s += "\(k): \(v)\r\n" }
+        // (no CORS headers: agents are not browsers, and a web page must not use or read this API)
+        for (k, v) in headers + [("Connection", "close")] { s += "\(k): \(v)\r\n" }
         return Data((s + "\r\n").utf8)
     }
 
@@ -131,7 +132,11 @@ public final class HTTPServer {
                 guard let i = l.firstIndex(of: ":") else { continue }
                 headers[l[..<i].lowercased()] = l[l.index(after: i)...].trimmingCharacters(in: .whitespaces)
             }
-            let need = Int(headers["content-length"] ?? "0") ?? 0
+            let cl = headers["content-length"] ?? "0"
+            guard !cl.isEmpty, cl.count <= 12, cl.allSatisfy({ $0.isASCII && $0.isNumber }), let need = Int(cl) else {
+                r.json(400, .object([("error", .object([("message", .string("bad Content-Length"))]))]))
+                return
+            }
             if need > 256 << 20 { r.json(413, .object([("error", .object([("message", .string("request too large"))]))])); return }
             let have = buf.count - end.upperBound
             if have < need && !done {
@@ -139,6 +144,13 @@ public final class HTTPServer {
                 return
             }
             let body = buf[end.upperBound ..< min(buf.count, end.upperBound + need)]
+            // DNS rebinding: a web page whose name resolves to 127.0.0.1 still sends its own name as Host
+            let host = (headers["host"] ?? "").lowercased()
+            let hname = host.hasPrefix("[") ? String(host.dropFirst().prefix { $0 != "]" }) : String(host.split(separator: ":").first ?? "")
+            guard ["127.0.0.1", "localhost", "::1"].contains(hname) else {
+                r.json(403, .object([("error", .object([("message", .string("forbidden host"))]))]))
+                return
+            }
             let req = Request(method: String(first[0]), path: String(first[1]), headers: headers, body: Data(body))
             Thread.detachNewThread { self.handler(req, r) }   // (generation blocks: a thread of its own)
         }

@@ -88,6 +88,9 @@ def current_model():
         c.request("GET", "/v1/models")
         name = json.loads(c.getresponse().read())["data"][0]["id"]
         c.close()
+        LAST_OK["t"] = now
+        if not re.fullmatch(r"[A-Za-z0-9._-]{1,64}", str(name)) or ".." in name:   # (a folder name, never a path)
+            name = None
     except (OSError, ValueError, KeyError, IndexError, http.client.HTTPException):
         scan_for_ps4()
     m = CURRENT.get("m")
@@ -120,7 +123,17 @@ BEACON_PORT = 8099
 FOUND = {"beacon_t": 0.0, "scan_t": 0.0}
 
 
+LAST_OK = {"t": 0.0}   # when the current console last answered
+IGNORED = set()
+
+
 def set_ps4(host, port, why):
+    if PS4B and (PS4B.host, PS4B.port) != (host, port) and why.startswith("announcement") and time.time() - LAST_OK["t"] < 15:
+        # announcements are not authenticated: keep a console that answers (anyone on the network could announce)
+        if host not in IGNORED:
+            IGNORED.add(host)
+            sys.stderr.write(f"[ps4] ignoring an announcement from {host}:{port} while {PS4B.host} answers\n")
+        return
     if PS4B and (PS4B.host, PS4B.port) != (host, port):
         sys.stderr.write(f"[ps4] console at {host}:{port} ({why})\n")
         PS4B.host, PS4B.port = host, port
@@ -474,7 +487,6 @@ class Handler(BaseHTTPRequestHandler):
         self.send_response(code)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(b)))
-        self.send_header("Access-Control-Allow-Origin", "*")
         self.end_headers()
         self.wfile.write(b)
 
@@ -482,7 +494,6 @@ class Handler(BaseHTTPRequestHandler):
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
         self.send_header("Cache-Control", "no-cache")
-        self.send_header("Access-Control-Allow-Origin", "*")
         self.end_headers()
 
     def _sse(self, data, event=None):
@@ -490,14 +501,21 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(s.encode())
         self.wfile.flush()
 
-    def do_OPTIONS(self):
-        self.send_response(204)
-        self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Access-Control-Allow-Headers", "*")
-        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-        self.end_headers()
+    # No CORS headers: agents are not browsers, and a web page must not use (or read) this API. The Host check stops
+    # DNS rebinding (a page whose name resolves to 127.0.0.1) while the proxy listens on this computer only.
+    def _host_ok(self):
+        if CFG.host not in ("127.0.0.1", "localhost", "::1"):
+            return True   # (listening on the network on purpose)
+        h = (self.headers.get("Host") or "").strip().lower()
+        name = h[1:h.index("]")] if h.startswith("[") and "]" in h else h.rsplit(":", 1)[0]
+        if name in ("127.0.0.1", "localhost", "::1"):
+            return True
+        self._json(403, {"error": {"message": "forbidden host"}})
+        return False
 
     def do_GET(self):
+        if not self._host_ok():
+            return
         self.m = current_model()
         p = self.path.split("?")[0]
         if p in ("/v1/models", "/models"):
@@ -518,9 +536,14 @@ class Handler(BaseHTTPRequestHandler):
             self._json(404, {"error": {"message": "not found"}})
 
     def do_POST(self):
+        if not self._host_ok():
+            return
         self.m = current_model() if not CFG.selftest else MODEL
         p = self.path.split("?")[0]
-        n = int(self.headers.get("Content-Length") or 0)
+        cl = (self.headers.get("Content-Length") or "0").strip()
+        if not cl.isdigit() or int(cl) > 256 << 20:
+            return self._json(400, {"error": {"message": "bad Content-Length"}})
+        n = int(cl)
         try:
             req = json.loads(self.rfile.read(n) or b"{}")
         except ValueError:
